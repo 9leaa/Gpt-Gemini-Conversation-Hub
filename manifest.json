@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "AI Conversation Toolkit",
+  "version": "1.3.0",
+  "description": "Optimize long web AI conversations and export full sessions with one click.",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chat.openai.com/*",
+        "https://chatgpt.com/*",
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "contentScript.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": [
+    "storage"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "pageHook.js"
+      ],
+      "matches": [
+        "https://gemini.google.com/*"
+      ]
+    }
+  ],
+  "host_permissions": [
+    "https://chat.openai.com/*",
+    "https://chatgpt.com/*",
+    "https://gemini.google.com/*"
+  ]
+}
