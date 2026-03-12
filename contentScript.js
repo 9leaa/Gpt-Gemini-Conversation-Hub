@@ -15,6 +15,10 @@
   const PROMPT_TOAST_ID = "chatgpt-toolkit-prompt-toast";
   const PROMPT_STORAGE_KEY = "chatgpt-toolkit-prompts-v1";
   const PROMPT_LOCAL_FALLBACK_KEY = "chatgpt-toolkit-prompts-fallback";
+  const AUTO_COLLAPSE_TOGGLE_ID = "chatgpt-toolkit-auto-collapse-toggle";
+  const LEGACY_AUTO_COLLAPSE_STORAGE_KEY = "chatgpt-toolkit-auto-collapse-enabled";
+  const AUTO_COLLAPSE_STORAGE_KEY_PREFIX = "chatgpt-toolkit-auto-collapse-enabled";
+  const AUTO_COLLAPSE_INTERVAL_MS = 10000;
   const APP_LABEL = "AI 对话工具";
   const PAGE_HOOK_SCRIPT_ID = "chatgpt-toolkit-page-hook";
   const PAGE_HOOK_SOURCE =
@@ -211,11 +215,17 @@
   };
 
   const platform = detectPlatform();
+  const DEFAULT_AUTO_COLLAPSE_ENABLED = platform.id !== "gemini";
+  const AUTO_COLLAPSE_SUBTITLE =
+    platform.id === "gemini"
+      ? "Gemini 默认关闭，开启后每 10 秒自动执行一次“优化长会话”"
+      : "默认开启，每 10 秒自动执行一次“优化长会话”";
 
   const state = {
     isCollapsed: false,
     isMinimized: false,
     isExporting: false,
+    autoCollapseEnabled: DEFAULT_AUTO_COLLAPSE_ENABLED,
     keepLatest: 20,
     collapsedNodes: [],
     cachedNodes: [],
@@ -241,7 +251,94 @@
   let pageHookInjectionPromise = null;
   let pageHookListenerAttached = false;
   let pageHookRequestCounter = 0;
+  let autoCollapseIntervalId = null;
+  let autoCollapseKickoffTimer = null;
   const pageHookRequests = new Map();
+
+  const getExtensionStorageArea = () =>
+    typeof chrome !== "undefined" && chrome?.storage?.local ? chrome.storage.local : null;
+
+  const getAutoCollapseStorageKey = (platformId = platform.id) =>
+    `${AUTO_COLLAPSE_STORAGE_KEY_PREFIX}:${platformId}`;
+
+  const readStoredBooleanFromLocal = (key) => {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw === null) {
+        return null;
+      }
+      return Boolean(JSON.parse(raw));
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const readBooleanFromLocal = (key, fallbackValue) => {
+    const storedValue = readStoredBooleanFromLocal(key);
+    return storedValue === null ? fallbackValue : storedValue;
+  };
+
+  const writeBooleanToLocal = (key, value) => {
+    try {
+      localStorage.setItem(key, JSON.stringify(Boolean(value)));
+      return true;
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const readAutoCollapsePreference = async () => {
+    const storage = getExtensionStorageArea();
+    const storageKey = getAutoCollapseStorageKey();
+    const scopedLocalValue = readStoredBooleanFromLocal(storageKey);
+    const legacyLocalValue = readStoredBooleanFromLocal(LEGACY_AUTO_COLLAPSE_STORAGE_KEY);
+    const fallbackValue = legacyLocalValue === null ? DEFAULT_AUTO_COLLAPSE_ENABLED : legacyLocalValue;
+
+    if (storage) {
+      return new Promise((resolve) => {
+        storage.get([storageKey, LEGACY_AUTO_COLLAPSE_STORAGE_KEY], (result) => {
+          if (chrome?.runtime?.lastError) {
+            resolve(scopedLocalValue === null ? fallbackValue : scopedLocalValue);
+            return;
+          }
+
+          if (typeof result?.[storageKey] === "boolean") {
+            resolve(result[storageKey]);
+            return;
+          }
+
+          if (typeof result?.[LEGACY_AUTO_COLLAPSE_STORAGE_KEY] === "boolean") {
+            resolve(result[LEGACY_AUTO_COLLAPSE_STORAGE_KEY]);
+            return;
+          }
+
+          resolve(scopedLocalValue === null ? fallbackValue : scopedLocalValue);
+        });
+      });
+    }
+
+    return scopedLocalValue === null ? fallbackValue : scopedLocalValue;
+  };
+
+  const writeAutoCollapsePreference = async (enabled) => {
+    const storageKey = getAutoCollapseStorageKey();
+    const storage = getExtensionStorageArea();
+    if (storage) {
+      const hasError = await new Promise((resolve) => {
+        storage.set({ [storageKey]: Boolean(enabled) }, () => {
+          resolve(Boolean(chrome?.runtime?.lastError));
+        });
+      });
+      if (!hasError) {
+        return;
+      }
+    }
+
+    const saved = writeBooleanToLocal(storageKey, enabled);
+    if (!saved) {
+      console.warn("[AI Toolkit] Failed to persist auto collapse preference.");
+    }
+  };
 
   const themeAttributeFilter = ["class", "data-theme", "style"];
   const toDatasetKey = (attribute) =>
@@ -1489,6 +1586,32 @@
     status.dataset.tone = tone;
   };
 
+  const syncAutoCollapseToggle = () => {
+    const toggle = document.getElementById(AUTO_COLLAPSE_TOGGLE_ID);
+    if (toggle instanceof HTMLInputElement) {
+      toggle.checked = state.autoCollapseEnabled;
+    }
+  };
+
+  const addNodesToCache = (nodes) => {
+    if (!Array.isArray(nodes) || nodes.length === 0) {
+      return;
+    }
+
+    if (state.cachedNodes.length === 0) {
+      state.cachedNodes = [...nodes];
+      return;
+    }
+
+    const cachedSet = new Set(state.cachedNodes);
+    nodes.forEach((node) => {
+      if (!cachedSet.has(node)) {
+        cachedSet.add(node);
+        state.cachedNodes.push(node);
+      }
+    });
+  };
+
   const saveMinimizedPosition = (position) => {
     localStorage.setItem(POSITION_KEY, JSON.stringify(position));
   };
@@ -1851,42 +1974,86 @@
       messages: buildPayloadFromAccumulator(accumulator),
     };
   };
-  const collapseOldMessages = () => {
+  const collapseOldMessages = ({ announce = true } = {}) => {
     ensureConversationState();
     const nodes = getMessageNodes();
     if (nodes.length === 0) {
-      updateStatus(`未识别到可优化的 ${platform.label} 消息。`, "info");
-      return;
+      if (announce) {
+        updateStatus(`未识别到可优化的 ${platform.label} 消息。`, "info");
+      }
+      return {
+        collapsedCount: 0,
+        reason: "empty",
+      };
     }
     if (nodes.length <= state.keepLatest) {
-      updateStatus("当前消息数量较少，无需优化。", "info");
-      return;
+      if (announce) {
+        updateStatus(state.isCollapsed ? "当前已处于优化状态。" : "当前消息数量较少，无需优化。", "info");
+      }
+      return {
+        collapsedCount: 0,
+        reason: state.isCollapsed ? "up_to_date" : "small",
+      };
     }
 
-    state.cachedNodes = nodes;
     const toCollapse = nodes.slice(0, nodes.length - state.keepLatest);
+    if (toCollapse.length === 0) {
+      return {
+        collapsedCount: 0,
+        reason: "up_to_date",
+      };
+    }
+
+    addNodesToCache(nodes);
 
     // 记录第一个保留的节点作为锚点
     const firstKeptNode = nodes[nodes.length - state.keepLatest];
     state.anchorNode = firstKeptNode;
     state.anchorParent = firstKeptNode?.parentNode;
 
-    state.collapsedNodes = toCollapse.map((node) => ({
-      node,
-      parent: node.parentNode,
-    }));
+    const existingCollapsedNodes = new Set(state.collapsedNodes.map((item) => item.node));
+    const newlyCollapsedNodes = toCollapse
+      .filter((node) => !existingCollapsedNodes.has(node))
+      .map((node) => ({
+        node,
+        parent: node.parentNode,
+      }));
 
-    toCollapse.forEach((node) => node.remove());
+    if (newlyCollapsedNodes.length === 0) {
+      if (announce) {
+        updateStatus("当前已处于优化状态。", "info");
+      }
+      return {
+        collapsedCount: 0,
+        reason: "up_to_date",
+      };
+    }
+
+    state.collapsedNodes = [...state.collapsedNodes, ...newlyCollapsedNodes];
+
+    newlyCollapsedNodes.forEach(({ node }) => node.remove());
 
     state.isCollapsed = true;
-    updateStatus(`已优化：隐藏 ${toCollapse.length} 条旧消息。`, "success");
+    if (announce) {
+      updateStatus(`已优化：隐藏 ${newlyCollapsedNodes.length} 条旧消息。`, "success");
+    }
+
+    return {
+      collapsedCount: newlyCollapsedNodes.length,
+      reason: "collapsed",
+    };
   };
 
-  const restoreMessages = () => {
+  const restoreMessages = ({ announce = true } = {}) => {
     ensureConversationState();
     if (!state.isCollapsed) {
-      updateStatus("没有需要恢复的消息。", "info");
-      return;
+      if (announce) {
+        updateStatus("没有需要恢复的消息。", "info");
+      }
+      return {
+        restoredCount: 0,
+        reason: "idle",
+      };
     }
 
     // 保存当前滚动位置：记录当前可见的第一个消息节点
@@ -1912,10 +2079,21 @@
       }
     }
 
+    const restoredCount = state.collapsedNodes.length;
+    const restoreAnchorNode =
+      state.anchorNode && state.anchorParent?.contains(state.anchorNode)
+        ? state.anchorNode
+        : visibleNodes[0] || null;
+    const restoreAnchorParent =
+      restoreAnchorNode?.parentNode ||
+      state.anchorParent ||
+      state.collapsedNodes.find((item) => item.parent)?.parent ||
+      null;
+
     // 使用锚点恢复：将所有隐藏的节点按顺序插入到锚点之前
     state.collapsedNodes.forEach(({ node, parent }) => {
-      if (state.anchorNode && state.anchorParent?.contains(state.anchorNode)) {
-        state.anchorParent.insertBefore(node, state.anchorNode);
+      if (restoreAnchorNode && restoreAnchorParent?.contains(restoreAnchorNode)) {
+        restoreAnchorParent.insertBefore(node, restoreAnchorNode);
       } else if (parent) {
         // 如果锚点不存在，尝试添加到原父节点
         parent.appendChild(node);
@@ -1935,7 +2113,85 @@
     state.anchorNode = null;
     state.anchorParent = null;
     state.isCollapsed = false;
-    updateStatus("已恢复所有消息。", "success");
+    if (announce) {
+      updateStatus("已恢复所有消息。", "success");
+    }
+
+    return {
+      restoredCount,
+      reason: "restored",
+    };
+  };
+
+  const stopAutoCollapseKickoff = () => {
+    if (autoCollapseKickoffTimer !== null) {
+      window.clearTimeout(autoCollapseKickoffTimer);
+      autoCollapseKickoffTimer = null;
+    }
+  };
+
+  const runAutoCollapse = () => {
+    if (!state.autoCollapseEnabled || state.isExporting) {
+      return;
+    }
+
+    collapseOldMessages({ announce: true });
+  };
+
+  const scheduleAutoCollapseKickoff = (delay = 600) => {
+    if (!state.autoCollapseEnabled) {
+      return;
+    }
+
+    stopAutoCollapseKickoff();
+    autoCollapseKickoffTimer = window.setTimeout(() => {
+      autoCollapseKickoffTimer = null;
+      runAutoCollapse();
+    }, delay);
+  };
+
+  const stopAutoCollapseInterval = () => {
+    if (autoCollapseIntervalId !== null) {
+      window.clearInterval(autoCollapseIntervalId);
+      autoCollapseIntervalId = null;
+    }
+  };
+
+  const startAutoCollapseInterval = () => {
+    stopAutoCollapseInterval();
+
+    if (!state.autoCollapseEnabled) {
+      return;
+    }
+
+    autoCollapseIntervalId = window.setInterval(() => {
+      runAutoCollapse();
+    }, AUTO_COLLAPSE_INTERVAL_MS);
+  };
+
+  const setAutoCollapseEnabled = async (enabled, { announce = true } = {}) => {
+    state.autoCollapseEnabled = Boolean(enabled);
+    syncAutoCollapseToggle();
+    stopAutoCollapseKickoff();
+
+    if (state.autoCollapseEnabled) {
+      startAutoCollapseInterval();
+      scheduleAutoCollapseKickoff(450);
+    } else {
+      stopAutoCollapseInterval();
+    }
+
+    await writeAutoCollapsePreference(state.autoCollapseEnabled);
+
+    if (!announce) {
+      return;
+    }
+
+    if (state.autoCollapseEnabled) {
+      updateStatus("已开启定时自动优化：每 10 秒自动执行一次。", "success");
+    } else {
+      updateStatus("已关闭定时自动优化。", "info");
+    }
   };
 
   const exportMessages = async () => {
@@ -2050,8 +2306,7 @@
   const toSafeText = (value) => (typeof value === "string" ? value.trim() : "");
   const normalizeCategory = (value) => toSafeText(value) || "未分类";
 
-  const getPromptStorageArea = () =>
-    typeof chrome !== "undefined" && chrome?.storage?.local ? chrome.storage.local : null;
+  const getPromptStorageArea = () => getExtensionStorageArea();
 
   const buildPromptStoragePayload = (items) => ({
     version: 1,
@@ -2814,6 +3069,21 @@
           </button>
         </div>
       </div>
+      <div class="chatgpt-toolkit-toggle-card">
+        <div class="chatgpt-toolkit-toggle-copy">
+          <strong class="chatgpt-toolkit-toggle-title">定时自动优化</strong>
+          <span class="chatgpt-toolkit-toggle-subtitle">${AUTO_COLLAPSE_SUBTITLE}</span>
+        </div>
+        <label class="chatgpt-toolkit-switch" for="${AUTO_COLLAPSE_TOGGLE_ID}">
+          <input
+            id="${AUTO_COLLAPSE_TOGGLE_ID}"
+            type="checkbox"
+            data-action="toggle-auto-collapse"
+            ${state.autoCollapseEnabled ? "checked" : ""}
+          />
+          <span class="chatgpt-toolkit-switch-track" aria-hidden="true"></span>
+        </label>
+      </div>
       <div class="chatgpt-toolkit-actions">
         <button type="button" class="chatgpt-toolkit-button" data-action="collapse">
           优化长会话
@@ -2834,6 +3104,14 @@
         <span>优化会隐藏旧消息，导出时会自动包含隐藏内容。</span>
       </p>
     `;
+
+    container.addEventListener("change", (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLInputElement) || target.dataset.action !== "toggle-auto-collapse") {
+        return;
+      }
+      void setAutoCollapseEnabled(target.checked);
+    });
 
     container.addEventListener("click", (event) => {
       const target = event.target;
@@ -3076,6 +3354,7 @@
     const toolbar = buildToolbar();
     document.body.appendChild(toolbar);
     ensureMinimizedButton();
+    syncAutoCollapseToggle();
     syncToolkitTheme();
   };
 
@@ -3094,43 +3373,71 @@
     });
   };
 
-  setupThemeSync();
-  attachToolbar();
-  setupResizeListener();
-  updateStatus(`已识别平台：${platform.label}。`, "info");
-  if (platform.id === "gemini") {
-    void ensurePageHookInjected().catch((error) => {
-      console.warn("[AI Toolkit] Gemini page hook bootstrap failed.", error);
-    });
-  }
+  const bootstrap = async () => {
+    state.autoCollapseEnabled = await readAutoCollapsePreference();
 
-  const observer = new MutationObserver(() => {
-    const toolbar = document.getElementById(TOOLKIT_ID);
-    const minimizedButton = document.getElementById(MINIMIZED_ID);
-    const promptModal = document.getElementById(PROMPT_MODAL_ID);
+    setupThemeSync();
+    attachToolbar();
+    setupResizeListener();
+    startAutoCollapseInterval();
 
-    if (!toolbar) {
-      attachToolbar();
+    updateStatus(
+      `已识别平台：${platform.label}。${state.autoCollapseEnabled ? " 定时自动优化已开启。" : ""}`,
+      "info"
+    );
+
+    if (state.autoCollapseEnabled) {
+      scheduleAutoCollapseKickoff(450);
+    }
+
+    if (platform.id === "gemini") {
+      void ensurePageHookInjected().catch((error) => {
+        console.warn("[AI Toolkit] Gemini page hook bootstrap failed.", error);
+      });
+    }
+
+    const observer = new MutationObserver(() => {
+      const previousConversationKey = state.conversationKey;
+      ensureConversationState();
+      const conversationChanged = previousConversationKey !== state.conversationKey;
+
+      const toolbar = document.getElementById(TOOLKIT_ID);
+      const minimizedButton = document.getElementById(MINIMIZED_ID);
+      const promptModal = document.getElementById(PROMPT_MODAL_ID);
+
+      if (!toolbar) {
+        attachToolbar();
+        observeThemeOnBodyIfNeeded();
+        syncToolkitTheme();
+        if (conversationChanged && state.autoCollapseEnabled) {
+          scheduleAutoCollapseKickoff(450);
+        }
+        return;
+      }
+
+      if (!minimizedButton) {
+        ensureMinimizedButton();
+      }
+
+      if (promptState.isOpen && !promptModal) {
+        const restoredModal = ensurePromptModal();
+        if (restoredModal) {
+          restoredModal.classList.add("is-visible");
+          renderPromptList();
+        }
+      }
+
       observeThemeOnBodyIfNeeded();
       syncToolkitTheme();
-      return;
-    }
+      syncAutoCollapseToggle();
 
-    if (!minimizedButton) {
-      ensureMinimizedButton();
-    }
-
-    if (promptState.isOpen && !promptModal) {
-      const restoredModal = ensurePromptModal();
-      if (restoredModal) {
-        restoredModal.classList.add("is-visible");
-        renderPromptList();
+      if (conversationChanged && state.autoCollapseEnabled) {
+        scheduleAutoCollapseKickoff(450);
       }
-    }
+    });
 
-    observeThemeOnBodyIfNeeded();
-    syncToolkitTheme();
-  });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  };
 
-  observer.observe(document.documentElement, { childList: true, subtree: true });
+  void bootstrap();
 })();
