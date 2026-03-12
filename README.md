@@ -2,9 +2,8 @@
 
 适用于网页端 AI 对话工具的浏览器扩展，目前支持：
 
-- `https://chat.openai.com/*`
-- `https://chatgpt.com/*`
-- `https://gemini.google.com/*`
+chatgpt
+gemini
 
 提供以下能力：
 
@@ -12,28 +11,6 @@
 - **一键导出当前会话**：导出为 JSON 文件，包含当前识别到的全部消息内容。
 - **Prompt 指令库**：支持 Prompt 的新增、删除、分类、排序、导入/导出 JSON、单击复制。
 
-## 这次迁移 Gemini 改了什么
-
-这个项目原来是强绑定 ChatGPT 的，迁移到 Gemini 不能只改域名，主要要改 4 类耦合点：
-
-1. `manifest.json`
-   - 给 `matches` 和 `host_permissions` 增加 `https://gemini.google.com/*`
-
-2. `contentScript.js`
-   - 把 ChatGPT 专属逻辑抽成 `PLATFORM_CONFIGS`
-   - 按平台分别配置：
-     - 会话 URL 规则
-     - 会话 ID 属性
-     - 消息节点选择器
-     - 角色识别属性
-     - 文本提取回退链
-
-3. UI 文案和导出文件名
-   - 从 `ChatGPT 工具` 改为 `AI 对话工具`
-   - 会话导出文件名改为 `{当前聊天框名字}.json`
-
-4. 样式资源
-   - 悬浮球改为平台短标识
 
 ## 功能说明
 
@@ -158,7 +135,7 @@ Prompt 指令库的导出文件为 JSON 对象，结构如下：
 - `styles.css`：工具浮层与 Prompt 弹窗样式
 - `image`：README 说明图片
 
-## 请作者喝杯奶茶
+## 感谢支持
 
 如果这个插件对你有用，顺手点个 star。
 
