@@ -2803,7 +2803,7 @@
     container.id = TOOLKIT_ID;
     container.innerHTML = `
       <div class="chatgpt-toolkit-header">
-        <span class="chatgpt-toolkit-kicker">项目地址：https://github.com/9leaa/LLMs-from-scratch，感谢支持</span>
+        <span class="chatgpt-toolkit-kicker">项目地址：https://github.com/9leaa/Gpt-Gemini-Conversation-Hub，感谢支持加星</span>
         <div class="chatgpt-toolkit-title-row">
           <div class="chatgpt-toolkit-heading">
             <strong>${APP_LABEL}</strong>
