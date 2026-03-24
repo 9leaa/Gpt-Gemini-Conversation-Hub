@@ -502,7 +502,6 @@
 
     return Boolean(extractTextContentDeep(node));
   };
-
   const getPlatformRoots = () => {
     const selectors = Array.isArray(platform.rootSelectors) && platform.rootSelectors.length > 0
       ? platform.rootSelectors
@@ -1234,17 +1233,22 @@
     })();
 
     const uniqueNodes = [];
-    const seen = new Set();
+    const seenNodes = new Set();
+    const seenTestIds = new Set();
     filteredByConversation.forEach((node) => {
-      const messageId =
-        node.getAttribute("data-message-id") ||
-        node.getAttribute("data-response-id") ||
-        node.getAttribute("data-testid");
-      const key = messageId || node;
-      if (seen.has(key)) {
+      if (seenNodes.has(node)) {
         return;
       }
-      seen.add(key);
+
+      const testId = node.getAttribute("data-testid");
+      if (testId && seenTestIds.has(testId)) {
+        return;
+      }
+
+      seenNodes.add(node);
+      if (testId) {
+        seenTestIds.add(testId);
+      }
       uniqueNodes.push(node);
     });
 
@@ -1317,6 +1321,154 @@
     }
 
     return queryFirstDeep(node, roleSelector) || node;
+  };
+
+  const getMessageIdForNode = (node, fallbackNode = null) =>
+    node?.getAttribute?.("data-message-id") ||
+    node?.getAttribute?.("data-response-id") ||
+    fallbackNode?.getAttribute?.("data-message-id") ||
+    fallbackNode?.getAttribute?.("data-response-id") ||
+    null;
+
+  const hasRoleAncestorWithinContainer = (node, container, roleSelector) => {
+    let current = getParentElementAcrossShadow(node);
+
+    while (current && current !== container) {
+      if (current.matches?.(roleSelector)) {
+        return true;
+      }
+      current = getParentElementAcrossShadow(current);
+    }
+
+    return false;
+  };
+
+  const getTopLevelRoleNodes = (node) => {
+    if (!(node instanceof Element)) {
+      return [];
+    }
+
+    const roleSelector = joinSelectors(platform.roleSelectors);
+    if (!roleSelector) {
+      return [];
+    }
+
+    if (node.matches(roleSelector)) {
+      return [node];
+    }
+
+    const roleNodes = [];
+    const seen = new Set();
+
+    queryAllDeep(node, roleSelector).forEach((candidate) => {
+      if (!(candidate instanceof Element) || seen.has(candidate)) {
+        return;
+      }
+
+      if (normalizeMessageNode(candidate) !== node) {
+        return;
+      }
+
+      if (hasRoleAncestorWithinContainer(candidate, node, roleSelector)) {
+        return;
+      }
+
+      seen.add(candidate);
+      roleNodes.push(candidate);
+    });
+
+    return roleNodes;
+  };
+
+  const normalizeComparableText = (value) =>
+    typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+
+  const mergeMessageTexts = (left, right) => {
+    const base = typeof left === "string" ? left.trim() : "";
+    const incoming = typeof right === "string" ? right.trim() : "";
+
+    if (!base) {
+      return incoming;
+    }
+    if (!incoming) {
+      return base;
+    }
+
+    const normalizedBase = normalizeComparableText(base);
+    const normalizedIncoming = normalizeComparableText(incoming);
+
+    if (!normalizedBase) {
+      return incoming;
+    }
+    if (!normalizedIncoming) {
+      return base;
+    }
+
+    if (normalizedBase === normalizedIncoming) {
+      return base.length >= incoming.length ? base : incoming;
+    }
+
+    if (normalizedIncoming.includes(normalizedBase)) {
+      return incoming;
+    }
+
+    if (normalizedBase.includes(normalizedIncoming)) {
+      return base;
+    }
+
+    return `${base}\n\n${incoming}`.replace(/\n{3,}/g, "\n\n").trim();
+  };
+
+  const mergeAdjacentMessageRecords = (
+    records,
+    { allowMissingMessageId = false, mergeSequentialAssistant = false } = {}
+  ) => {
+    const merged = [];
+
+    records.forEach((record) => {
+      if (!record?.text) {
+        return;
+      }
+
+      const previous = merged[merged.length - 1];
+      const canMerge =
+        previous &&
+        previous.role === record.role &&
+        (
+          (previous.messageId && record.messageId && previous.messageId === record.messageId) ||
+          (
+            allowMissingMessageId &&
+            (!previous.messageId || !record.messageId)
+          ) ||
+          (
+            mergeSequentialAssistant &&
+            previous.role === "assistant"
+          )
+        );
+
+      if (canMerge) {
+        previous.messageId = previous.messageId || record.messageId || null;
+        previous.text = mergeMessageTexts(previous.text, record.text);
+        return;
+      }
+
+      if (
+        previous &&
+        previous.role === record.role &&
+        previous.messageId === record.messageId &&
+        normalizeComparableText(previous.text) === normalizeComparableText(record.text)
+      ) {
+        return;
+      }
+
+      merged.push({
+        messageId: record.messageId || null,
+        role: record.role,
+        text: record.text,
+      });
+    });
+
+    return merged;
   };
 
   const detectRole = (node) => {
@@ -1418,46 +1570,60 @@
     return extractTextContentDeep(contentNode);
   };
 
-  const getMessageRecord = (node, seenMessageIds, signatureOccurrences) => {
+  const getMessageRecord = (node, container = node) => {
     const roleNode = findRoleNode(node);
-    const messageId =
-      roleNode?.getAttribute?.("data-message-id") ||
-      roleNode?.getAttribute?.("data-response-id") ||
-      node.getAttribute("data-message-id") ||
-      node.getAttribute("data-response-id");
-
-    if (messageId && seenMessageIds.has(messageId)) {
-      return null;
-    }
-    if (messageId) {
-      seenMessageIds.add(messageId);
-    }
-
     const role = detectRole(roleNode);
     const text = extractMessageText(roleNode);
     if (!text) {
       return null;
     }
 
-    const signature = messageId ? `id:${messageId}` : `${role}\u0000${text}`;
-    const occurrence = (signatureOccurrences.get(signature) || 0) + 1;
-    signatureOccurrences.set(signature, occurrence);
-
     return {
-      key: messageId ? signature : `sig:${signature}\u0000${occurrence}`,
-      messageId: messageId || null,
+      messageId: getMessageIdForNode(roleNode, container),
       role,
       text,
     };
   };
 
-  const getMessageRecords = (nodes) => {
-    const seenIds = new Set();
-    const signatureOccurrences = new Map();
+  const getMessageRecordsForNode = (node) => {
+    const roleNodes = getTopLevelRoleNodes(node);
+    const candidateNodes = roleNodes.length > 0 ? roleNodes : [node];
 
-    return nodes
-      .map((node) => getMessageRecord(node, seenIds, signatureOccurrences))
-      .filter(Boolean);
+    return mergeAdjacentMessageRecords(
+      candidateNodes
+        .map((candidateNode) => getMessageRecord(candidateNode, node))
+        .filter(Boolean),
+      { allowMissingMessageId: true }
+    );
+  };
+
+  const getMessageRecords = (nodes) => {
+    const signatureOccurrences = new Map();
+    const mergedRecords = mergeAdjacentMessageRecords(
+      nodes.flatMap((node) => getMessageRecordsForNode(node)),
+      {
+        allowMissingMessageId: false,
+        mergeSequentialAssistant: platform.id === "chatgpt",
+      }
+    );
+
+    return mergedRecords.map((record) => {
+      const signature = record.messageId ? `id:${record.messageId}` : `${record.role}\u0000${record.text}`;
+      const occurrence = (signatureOccurrences.get(signature) || 0) + 1;
+      signatureOccurrences.set(signature, occurrence);
+
+      return {
+        key:
+          record.messageId
+            ? occurrence === 1
+              ? signature
+              : `${signature}#${occurrence}`
+            : `sig:${signature}\u0000${occurrence}`,
+        messageId: record.messageId || null,
+        role: record.role,
+        text: record.text,
+      };
+    });
   };
 
   const buildPayloadFromRecords = (records) =>
@@ -1518,9 +1684,13 @@
     }
 
     snapshotRecords.forEach((record) => {
-      if (!accumulator.recordsByKey.has(record.key)) {
+      const existingRecord = accumulator.recordsByKey.get(record.key);
+      if (!existingRecord) {
         accumulator.recordsByKey.set(record.key, record);
+        return;
       }
+
+      existingRecord.text = mergeMessageTexts(existingRecord.text, record.text);
     });
 
     const snapshotKeys = snapshotRecords.map((record) => record.key);
